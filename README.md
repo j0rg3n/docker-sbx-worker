@@ -69,6 +69,8 @@ Still to confirm on the first real run:
 
 - Passing the broker config inline with `sbx run --name N -- --mcp-config '<json>'`.
 - `template/build.sh` (`docker save` followed by `sbx template load`), and whether `dotnet-sdk-10.0` exists in 26.04.
+- The output of `sbx template ls`. When `agent.template` is set, `up` checks it for the tag
+  (as `repo:tag` or as separate repo and tag columns) before creating the sandbox.
 
 ## Setup
 
