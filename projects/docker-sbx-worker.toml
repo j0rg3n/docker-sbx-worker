@@ -1,0 +1,46 @@
+# The worker working on its own repository.
+# Copy to ~/.config/sbx-worker/projects/docker-sbx-worker.toml.
+name = "docker-sbx-worker"
+# Standard library only: nothing to install, so no package proxy.
+packages = []
+
+[github]
+repo = "j0rg3n/docker-sbx-worker"
+base_branch = "main"
+token_file = "~/.config/sbx-worker/tokens/docker-sbx-worker"
+
+[broker]
+listen_port = 8766                 # layeredlight uses 8765
+branch_prefix = "agent/"
+status_labels = ["ready", "in-progress", "in-review", "needs-refinement"]
+# The repo is public, so anyone can open an issue. Labels need triage access, so only
+# issues you label "agent" are visible to the sandbox at all.
+required_label = "agent"
+forbidden_paths = [".github/", ".claude/"]
+draft_prs = true
+comment_footer = "_Posted by the sandboxed issue worker._"
+
+[agent]
+work_dir = "."
+install = "none needed (standard library only)"
+test = "python3 broker/test_broker.py"
+verify = [
+  "python3 broker/test_broker.py",
+  "python3 -m py_compile bin/sbx-worker broker/forge_broker.py",
+]
+design_docs = ["README.md"]
+notes = """
+This repository is the sandbox and broker the agent itself runs under. Changes to
+broker/forge_broker.py or bin/sbx-worker change the security boundary: never loosen a check
+(branch prefix, forbidden paths, secret scanner, fast-forward-only push, label rules) unless the
+issue explicitly asks for it, and call out any such change at the top of the PR body.
+broker/test_broker.py must keep passing and should gain a check for every new rule.
+The tests start local servers on ports 18765, 18766 and 19418 and a git daemon; that works
+inside the sandbox.
+"""
+
+[agent.labels]
+ready = "ready"
+in_progress = "in-progress"
+review = "in-review"
+refinement = "needs-refinement"
