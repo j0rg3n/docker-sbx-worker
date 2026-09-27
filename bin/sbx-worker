@@ -1,0 +1,426 @@
+#!/usr/bin/env python3
+"""sbx-worker: run Claude Code in a locked-down Docker Sandbox for one project.
+
+  sbx-worker up     <project>   start broker + proxies, create/configure the sandbox, and run
+                                Claude in tmux session sbxw-<project>; if that session is
+                                already running, just attach to it
+  sbx-worker attach <project>   attach to the running tmux session
+  sbx-worker broker <project>   run only the broker in the foreground (debugging)
+  sbx-worker down   <project>   end the tmux session (stops the loop) and the broker;
+                                the sandbox itself is left alone
+  sbx-worker status <project>   show what is running and the sandbox's network rules
+  sbx-worker rm     <project>   remove the sandbox (the broker's source clone is kept)
+
+<project> is a name under ~/.config/sbx-worker/projects/<name>.toml, or a path to a .toml.
+
+The sandbox runs in sbx --clone mode: it gets a read-only mount of the broker's own clone
+of the repo and works on a private clone inside the VM. Nothing on the host is writable
+from the sandbox. Always attach with `sbx-worker up` or `attach`; a plain `sbx run --name`
+starts a second Claude without the forge MCP server.
+
+Inside tmux: detach with Ctrl-b d; the loop keeps running.
+"""
+
+import io
+import json
+import os
+import secrets
+import shlex
+import shutil
+import signal
+import socket
+import subprocess
+import sys
+import tarfile
+import time
+import tomllib
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(ROOT / "broker"))
+import forge_broker  # noqa: E402
+
+CONFIG_DIR = Path("~/.config/sbx-worker").expanduser()
+HOST = "host.docker.internal"
+
+# The claude kit allows these; deny wins over allow. mcp-proxy carries claude.ai connectors
+# (mail, Jira, Slack, ...) that would give the sandbox your account's integrations.
+DENY_HOSTS = ["mcp-proxy.anthropic.com"]
+# Where sbx mounts the source read-only inside the VM (--clone mode).
+VM_SOURCE = "/run/sandbox/source"
+
+# Host-side caching proxies (proxies/compose.yaml). The sandbox reaches them as
+# host.docker.internal:<port>; sbx policy must allow localhost:<port>.
+PROXIES = {
+    "npm":   {"service": "verdaccio", "port": 4873},
+    "pypi":  {"service": "proxpi",    "port": 5000},
+    "nuget": {"service": "bagetter",  "port": 5555},
+}
+# Baked into the sandbox at creation (sbx create -e).
+PKG_ENV = {
+    "npm": {"NPM_CONFIG_REGISTRY": f"http://{HOST}:4873/"},
+    "pypi": {
+        "PIP_INDEX_URL": f"http://{HOST}:5000/index/",
+        "PIP_TRUSTED_HOST": HOST,
+        "UV_DEFAULT_INDEX": f"http://{HOST}:5000/index/",
+        "UV_INSECURE_HOST": HOST,
+    },
+    "nuget": {},
+}
+# Written into the sandbox user's home on every `up`.
+PKG_FILES = {
+    "nuget": {".nuget/NuGet/NuGet.Config": f"""<?xml version="1.0" encoding="utf-8"?>
+<configuration>
+  <packageSources>
+    <clear />
+    <add key="proxy" value="http://{HOST}:5555/v3/index.json" allowInsecureConnections="true" />
+  </packageSources>
+</configuration>
+"""},
+}
+
+
+def die(msg):
+    sys.exit(f"sbx-worker: {msg}")
+
+
+def run(*cmd, check=True, capture=False, **kw):
+    print("+ " + " ".join(map(str, cmd)), file=sys.stderr)
+    r = subprocess.run(list(map(str, cmd)), text=kw.pop("text", True), capture_output=capture, **kw)
+    if check and r.returncode != 0:
+        err = r.stderr if isinstance(r.stderr, str) else (r.stderr or b"").decode(errors="replace")
+        die(f"command failed ({r.returncode}): {' '.join(map(str, cmd))}\n{(err or '')[-2000:]}")
+    return r
+
+
+def load(project):
+    p = Path(project)
+    if not p.suffix:
+        p = CONFIG_DIR / "projects" / f"{project}.toml"
+    p = p.expanduser().resolve()
+    if not p.exists():
+        die(f"no config at {p} (copy projects/example.toml there)")
+    with open(p, "rb") as f:
+        raw = tomllib.load(f)
+    tok = Path(raw["github"]["token_file"]).expanduser()
+    if not tok.is_file():
+        found = sorted(x.name for x in tok.parent.glob("*")) if tok.parent.is_dir() else []
+        die(f"token file {tok} not found (github.token_file in {p})"
+            + (f"; {tok.parent} has: {', '.join(found)}" if found else ""))
+    if tok.stat().st_mode & 0o077:
+        die(f"{tok} is readable by other users; chmod 600 it")
+    cfg = forge_broker.Config(p)
+    unknown = set(raw.get("packages", [])) - PROXIES.keys()
+    if unknown:
+        die(f"unknown packages entries {sorted(unknown)}; use {sorted(PROXIES)}")
+    roles = raw.get("agent", {}).get("labels", {})
+    missing = [v for v in roles.values() if v not in cfg.status_labels]
+    if missing:
+        die(f"agent.labels {missing} are not in broker.status_labels")
+    return p, cfg, raw
+
+
+def project_md(cfg, raw):
+    a = raw.get("agent", {})
+    labels = a.get("labels", {})
+    lines = [
+        f"# Project: {cfg.name}",
+        "",
+        "Written by sbx-worker on the host and replaced on every start.",
+        "",
+        f"- Repository: `{cfg.owner}/{cfg.repo}` (only through the forge MCP tools)",
+        "- `origin` is a read-only copy on the host; `sync_base` refreshes it, then `git fetch origin`.",
+        f"- Base branch `<base>`: `{cfg.base_branch}`",
+        f"- Branch prefix `<prefix>`: `{cfg.branch_prefix}`",
+        f"- Working directory `<work_dir>`: `{a.get('work_dir', '.')}`",
+        f"- Install dependencies: `{a.get('install', 'see README')}`",
+        f"- Quick test `<test>`: `{a.get('test', 'see README')}`",
+        "- Verify `<verify>` (all must pass):",
+        *[f"  - `{c}`" for c in a.get("verify", [])],
+        f"- Package proxies available: {', '.join(raw.get('packages', [])) or 'none'}",
+        f"- Paths the broker refuses in PRs: {', '.join(cfg.forbidden_paths) or 'none'}",
+        "",
+        "## Status labels",
+        "",
+        f"- ready: `{labels.get('ready', 'ready')}`",
+        f"- in progress: `{labels.get('in_progress', 'in-progress')}`",
+        f"- review: `{labels.get('review', 'in-review')}`",
+        f"- refinement: `{labels.get('refinement', 'needs-refinement')}`",
+    ]
+    if a.get("design_docs"):
+        lines += ["", "## Design docs to check", "", *[f"- `{d}`" for d in a["design_docs"]]]
+    if a.get("notes"):
+        lines += ["", "## Notes", "", a["notes"].strip()]
+    return "\n".join(lines) + "\n"
+
+
+# ------------------------------------------------------------------- helpers
+
+def port_open(port):
+    with socket.socket() as s:
+        s.settimeout(0.5)
+        return s.connect_ex(("127.0.0.1", port)) == 0
+
+
+def start_broker(path, cfg):
+    pidfile = cfg.state_dir / "broker.pid"
+    if pidfile.exists():
+        try:
+            os.kill(int(pidfile.read_text()), signal.SIGTERM)
+        except ProcessLookupError:
+            pass
+        for _ in range(20):
+            if not port_open(cfg.listen_port):
+                break
+            time.sleep(0.1)
+    if port_open(cfg.listen_port):
+        die(f"port {cfg.listen_port} is in use by something other than this project's broker")
+    client_token = secrets.token_urlsafe(32)
+    log = open(cfg.state_dir / "broker.log", "a")
+    p = subprocess.Popen([sys.executable, str(ROOT / "broker" / "forge_broker.py"), "--config", str(path)],
+                         env={**os.environ, "SBX_BROKER_CLIENT_TOKEN": client_token},
+                         stdout=log, stderr=log, start_new_session=True)
+    pidfile.write_text(str(p.pid))
+    for _ in range(50):
+        if port_open(cfg.listen_port):
+            return client_token
+        if p.poll() is not None:
+            break
+        time.sleep(0.1)
+    die(f"broker did not start; see {cfg.state_dir / 'broker.log'}")
+
+
+def ensure_ssh_forwarding_off():
+    """sbx forwards the host SSH agent into sandboxes by default."""
+    r = run("sbx", "settings", "get", "ssh.agentForwardingEnabled", capture=True, check=False)
+    if "false" in (r.stdout or "").lower():
+        return
+    run("sbx", "settings", "set", "ssh.agentForwardingEnabled", "false")
+    print("\nSSH agent forwarding is now off, but only takes effect after `sbx daemon restart`.\n"
+          "That restarts the daemon for ALL sandboxes, including ones you have open.")
+    if input("Restart the sbx daemon now? [y/N] ").strip().lower() != "y":
+        die("not continuing while the SSH agent is still forwarded; run `sbx daemon restart` first")
+    run("sbx", "daemon", "restart")
+
+
+def ensure_no_gateway_servers():
+    """sbx's MCP gateway inside every VM can add any server registered with `sbx mcp add`
+    (mcp-find / mcp-add), and the network policy does not apply to it. So none may exist."""
+    r = run("sbx", "mcp", "ls", capture=True, check=False)
+    out = (r.stdout or "").strip()
+    if r.returncode != 0 or (out and "No MCP servers registered" not in out):
+        die("MCP servers are registered with sbx:\n" + out + "\n\nAny sandbox can add these "
+            "through sbx's MCP gateway, bypassing the network policy (and --command servers run on "
+            "the host). Remove them with `sbx mcp rm <name>` before starting a worker sandbox.")
+
+
+# Drops sbx's gateway entry from the VM's Claude config, so a nested `claude` doesn't pick
+# it up by default. The gateway stays reachable; ensure_no_gateway_servers keeps it empty.
+DROP_GATEWAY = """
+import json, os
+p = os.path.expanduser("~/.claude.json")
+c = json.load(open(p))
+def drop(o):
+    if isinstance(o, dict):
+        o.get("mcpServers", {}).pop("mcp-gateway", None)
+        for v in o.values():
+            drop(v)
+drop(c)
+json.dump(c, open(p, "w"), indent=2)
+"""
+
+
+def ensure_proxies(packages):
+    if not packages:
+        return
+    env_file = CONFIG_DIR / "proxies.env"
+    if not env_file.exists():
+        env_file.parent.mkdir(parents=True, exist_ok=True)
+        fd = os.open(env_file, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        with os.fdopen(fd, "w") as f:
+            f.write(f"BAGETTER_API_KEY={secrets.token_urlsafe(32)}\n")
+    run("docker", "compose", "--env-file", env_file, "-f", ROOT / "proxies" / "compose.yaml",
+        "up", "-d", *[PROXIES[p]["service"] for p in packages])
+
+
+def sandbox_exists(name):
+    r = run("sbx", "ls", capture=True, check=False)
+    return any(line.split()[:1] == [name] for line in (r.stdout or "").splitlines())
+
+
+def ensure_allowed(name, port):
+    rules = run("sbx", "policy", "ls", name, "--wide", capture=True, check=False).stdout or ""
+    if f"localhost:{port}" not in rules:
+        run("sbx", "policy", "allow", "network", f"localhost:{port}", "--sandbox", name)
+
+
+def ensure_denied(name, host):
+    rules = run("sbx", "policy", "ls", name, "--wide", capture=True, check=False).stdout or ""
+    if not any("deny" in line.split() and host in line for line in rules.splitlines()):
+        run("sbx", "policy", "deny", "network", host, "--sandbox", name)
+
+
+def tmux_running(session):
+    return subprocess.run(["tmux", "has-session", "-t", f"={session}"],
+                          capture_output=True).returncode == 0
+
+
+def tmux_attach(session):
+    verb = "switch-client" if os.environ.get("TMUX") else "attach-session"
+    os.execvp("tmux", ["tmux", verb, "-t", f"={session}"])
+
+
+def _anonymous(ti):
+    ti.uid = ti.gid = 0
+    ti.uname = ti.gname = ""
+    return ti
+
+
+def push_home_files(name, files):
+    """Copy {relative-path-under-$HOME: bytes|Path-to-dir} into the sandbox over exec stdin."""
+    buf = io.BytesIO()
+    with tarfile.open(fileobj=buf, mode="w") as tar:
+        for rel, src in files.items():
+            if isinstance(src, Path):
+                tar.add(src, arcname=rel, filter=_anonymous)
+            else:
+                data = src.encode() if isinstance(src, str) else src
+                ti = tarfile.TarInfo(rel)
+                ti.size = len(data)
+                ti.mode = 0o644
+                tar.addfile(ti, io.BytesIO(data))
+    run("sbx", "exec", "-i", name, "sh", "-c", 'cd "$HOME" && tar --no-same-owner -xf -',
+        input=buf.getvalue(), text=False)
+
+
+# ------------------------------------------------------------------- commands
+
+def cmd_up(project):
+    path, cfg, raw = load(project)
+    if shutil.which("sbx") is None:
+        die("sbx is not installed")
+    cfg.state_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+    if shutil.which("tmux") is None:
+        die("tmux is not installed")
+    name = cfg.sandbox
+    packages = raw.get("packages", [])
+    a = raw.get("agent", {})
+
+    if tmux_running(name):
+        # Restarting the broker here would cut off the running loop's MCP connection.
+        print(f"{name} is already running; attaching. Use `sbx-worker down {cfg.name}` to restart it.")
+        tmux_attach(name)
+
+    ensure_ssh_forwarding_off()
+    ensure_no_gateway_servers()
+    forge_broker.Tools(cfg).sync_source()      # the repo sbx mounts read-only
+    client_token = start_broker(path, cfg)
+    ensure_proxies(packages)
+
+    if not sandbox_exists(name):
+        env = {k: v for p in packages for k, v in PKG_ENV[p].items()}
+        env["GH_TOKEN"] = ""                    # no GitHub CLI auth, whatever sbx would provide
+        tmpl = ["-t", a["template"], "--pull", "never"] if a.get("template") else []
+        run("sbx", "create", "--clone", "--name", name, "--skills", "off", *tmpl,
+            *[x for h in DENY_HOSTS for x in ("--deny-network", h)],
+            *[x for k, v in env.items() for x in ("-e", f"{k}={v}")],
+            "claude", cfg.source)
+
+    for h in DENY_HOSTS:
+        ensure_denied(name, h)
+    ensure_allowed(name, cfg.listen_port)
+    for p in packages:
+        ensure_allowed(name, PROXIES[p]["port"])
+
+    files = {".sbx/project.md": project_md(cfg, raw)}
+    for d in sorted((ROOT / "sandbox" / "skills").iterdir()):
+        if d.is_dir():
+            files[f".claude/skills/{d.name}"] = d
+    for p in packages:
+        files.update(PKG_FILES.get(p, {}))
+    push_home_files(name, files)
+    run("sbx", "exec", name, "git", "config", "--global", "user.name", a.get("git_name", "sbx-agent"))
+    run("sbx", "exec", name, "git", "config", "--global", "user.email",
+        a.get("git_email", "sbx-agent@users.noreply.github.com"))
+    # sbx copies the source's origin URL (GitHub) into the VM clone; point it at the
+    # read-only mount, which is where sync_base delivers new commits.
+    run("sbx", "exec", name, "git", "-C", cfg.source, "remote", "set-url", "origin", VM_SOURCE)
+    run("sbx", "exec", name, "python3", "-c", DROP_GATEWAY)
+
+    mcp = json.dumps({"mcpServers": {"forge": {
+        "type": "http",
+        "url": f"http://{HOST}:{cfg.listen_port}/mcp",
+        "headers": {"Authorization": f"Bearer {client_token}"},
+    }}})
+    claude = shlex.join(["sbx", "run", "--name", name,
+                         "-e", "ENABLE_CLAUDEAI_MCP_SERVERS=false",   # no claude.ai connectors
+                         "--", "--strict-mcp-config", "--mcp-config", mcp])
+    # Create the session first so remain-on-exit is set before Claude starts: if it exits
+    # immediately, the pane stays open with the error instead of the session vanishing.
+    run("tmux", "new-session", "-d", "-s", name, "-x", "220", "-y", "50")
+    window = f"={name}:"      # a bare "=name" would be read as a window name
+    run("tmux", "set-option", "-w", "-t", window, "remain-on-exit", "on")
+    run("tmux", "respawn-pane", "-k", "-t", window, claude)
+    # Claude Code copies with OSC 52; tmux only passes that to the terminal when this is on.
+    # It is a server option, so it also applies to your other tmux sessions.
+    run("tmux", "set-option", "-s", "set-clipboard", "on")
+    print(f"\nsandbox {name} ready in tmux session {name}.\n"
+          "Start the loop with:  /loop 30m /issue-worker    Detach: Ctrl-b d\n")
+    time.sleep(1)
+    tmux_attach(name)
+
+
+def cmd_attach(project):
+    _, cfg, _ = load(project)
+    if not tmux_running(cfg.sandbox):
+        die(f"{cfg.sandbox} is not running; start it with `sbx-worker up {cfg.name}`")
+    tmux_attach(cfg.sandbox)
+
+
+def cmd_broker(project):
+    path, cfg, _ = load(project)
+    os.execvp(sys.executable, [sys.executable, str(ROOT / "broker" / "forge_broker.py"), "--config", str(path)])
+
+
+def cmd_down(project):
+    _, cfg, _ = load(project)
+    if tmux_running(cfg.sandbox):
+        run("tmux", "kill-session", "-t", f"={cfg.sandbox}")
+        print(f"tmux session {cfg.sandbox} ended")
+    pidfile = cfg.state_dir / "broker.pid"
+    if pidfile.exists():
+        try:
+            os.kill(int(pidfile.read_text()), signal.SIGTERM)
+            print("broker stopped")
+        except ProcessLookupError:
+            print("broker was not running")
+        pidfile.unlink()
+
+
+def cmd_status(project):
+    _, cfg, _ = load(project)
+    print(f"broker on :{cfg.listen_port}: {'up' if port_open(cfg.listen_port) else 'down'}")
+    print(f"tmux session {cfg.sandbox}: {'running' if tmux_running(cfg.sandbox) else 'not running'}")
+    run("sbx", "ls", check=False)
+    run("sbx", "policy", "ls", cfg.sandbox, "--wide", check=False)
+
+
+def cmd_rm(project):
+    _, cfg, _ = load(project)
+    cmd_down(project)
+    run("sbx", "rm", cfg.sandbox)
+
+
+def main():
+    cmds = {"up": cmd_up, "attach": cmd_attach, "broker": cmd_broker, "down": cmd_down,
+            "status": cmd_status, "rm": cmd_rm}
+    if len(sys.argv) != 3 or sys.argv[1] not in cmds:
+        sys.exit(__doc__)
+    try:
+        cmds[sys.argv[1]](sys.argv[2])
+    except forge_broker.ToolError as e:
+        die(str(e))
+
+
+if __name__ == "__main__":
+    main()

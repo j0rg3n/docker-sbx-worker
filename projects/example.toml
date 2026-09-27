@@ -1,0 +1,50 @@
+# Per-project config. Real copies live in ~/.config/sbx-worker/projects/<name>.toml.
+# The sandbox cannot read or change this file; it decides everything the agent may do.
+
+name = "example"
+
+
+# Package proxies this project needs. Only these ports are opened for its sandbox.
+# Any of: "nuget", "npm", "pypi"
+packages = ["pypi"]
+
+[github]
+repo = "j0rg3n/example"
+base_branch = "main"
+# Fine-grained PAT for this one repository. Permissions:
+#   Contents: read/write, Pull requests: read/write, Issues: read/write, Metadata: read.
+#   NOT Workflows, NOT Administration, NOT Secrets.
+token_file = "~/.config/sbx-worker/tokens/example"
+
+[broker]
+listen_port = 8765                 # one port per project
+branch_prefix = "agent/"
+status_labels = ["status/todo", "status/in-progress", "status/review", "status/blocked"]
+# Optional: the agent can only see and touch issues carrying this label.
+required_label = "agent"
+# Refuse PRs touching these paths (CI definitions run with repo secrets).
+forbidden_paths = [".github/"]
+draft_prs = true
+comment_footer = "_Posted by a sandboxed agent._"
+
+[agent]
+# What the agent needs to know about this project; written into ~/.sbx/project.md in the sandbox.
+work_dir = "."
+install = "pip install -e '.[dev]'"
+test = "pytest -q"
+verify = ["pytest", "ruff check ."]
+design_docs = []
+git_name = "sbx-agent"
+git_email = "sbx-agent@users.noreply.github.com"
+# Custom sandbox image with the toolchains preinstalled (see template/). Omit for the default.
+# template = "sbx-worker-dev:1"
+notes = """
+Anything project-specific the skills should know.
+"""
+
+# Which of broker.status_labels plays which role in the issue-worker/feature-work flow.
+[agent.labels]
+ready = "status/todo"
+in_progress = "status/in-progress"
+review = "status/review"
+refinement = "status/blocked"

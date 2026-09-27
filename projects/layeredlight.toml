@@ -1,0 +1,43 @@
+# Copy to ~/.config/sbx-worker/projects/layeredlight.toml and adjust.
+name = "layeredlight"
+packages = ["npm"]
+
+[github]
+repo = "j0rg3n/homey-layered-light-scene"
+base_branch = "main"
+token_file = "~/.config/sbx-worker/tokens/layeredlight"
+
+[broker]
+listen_port = 8765
+branch_prefix = "agent/"
+status_labels = ["ready", "in-progress", "in-review", "needs-refinement"]
+forbidden_paths = [".github/", ".claude/"]
+draft_prs = false
+comment_footer = "_Posted by the sandboxed issue worker._"
+
+[agent]
+work_dir = "com.fabeljet.layeredlight"
+install = "npm ci"
+test = "./node_modules/.bin/jest"
+verify = [
+  "./node_modules/.bin/jest --coverage",
+  "./node_modules/.bin/tsc --noEmit",
+  "npm run lint",
+]
+design_docs = [
+  "com.fabeljet.layeredlight/SPEC.md",
+  "com.fabeljet.layeredlight/KEYFRAME_DESIGN.md",
+  "com.fabeljet.layeredlight/TEST_PLAN.md",
+  "com.fabeljet.layeredlight/TODO.md",
+]
+notes = """
+Follow AGENTS.md at the repo root: SPEC.md -> PLAN.md -> implement -> test -> typecheck -> lint -> commit.
+Target 60-70% test coverage; mock Homey APIs as the existing tests do.
+Playwright e2e tests (npm run test:e2e) need browser downloads and are not available in the sandbox.
+"""
+
+[agent.labels]
+ready = "ready"
+in_progress = "in-progress"
+review = "in-review"
+refinement = "needs-refinement"
