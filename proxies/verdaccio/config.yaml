@@ -1,0 +1,22 @@
+# Read-only npm pull-through cache. Nobody can register, so nobody can publish.
+storage: /verdaccio/storage/data
+auth:
+  htpasswd:
+    file: /verdaccio/storage/htpasswd
+    max_users: -1
+uplinks:
+  npmjs:
+    url: https://registry.npmjs.org/
+    cache: true
+packages:
+  '@*/*':
+    access: $all
+    publish: nobody-group
+    unpublish: nobody-group
+    proxy: npmjs
+  '**':
+    access: $all
+    publish: nobody-group
+    unpublish: nobody-group
+    proxy: npmjs
+log: {type: stdout, format: pretty, level: http}
