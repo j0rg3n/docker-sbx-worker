@@ -102,7 +102,10 @@ Still to confirm on the first real run:
    ```
 
    Claude runs in the tmux session `sbxw-<project>`, so closing the terminal doesn't stop the
-   loop. If that session is running, `up` only attaches, so the broker isn't restarted under
+   loop. The Claude session is named `sbxw-<project>`, and `up` resumes the same conversation
+   after `down` or a reboot. Its id is kept in `~/.local/state/sbx-worker/<project>/session-id`;
+   delete that file to start a new conversation. A resumed conversation doesn't bring back
+   the `/loop` job, so start the loop again. If that session is running, `up` only attaches, so the broker isn't restarted under
    a running loop. Don't use a plain `sbx run --name sbxw-<project>`: it starts a second
    Claude that has no broker connection.
 
