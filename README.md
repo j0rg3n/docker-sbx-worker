@@ -64,11 +64,12 @@ A throwaway sandbox confirmed each of these:
 - Skills and config can be copied into the VM through `sbx exec -i` stdin. With `--skills off`,
   sbx's shared skills store stays out, so your other sandboxes are unaffected.
 - The base image (`claude-code-docker`, Ubuntu 26.04) already has git, node, npm, python3, pip and uv.
+- `template/Dockerfile` builds with the host Docker Engine; `dotnet-sdk-10.0` is in the 26.04 repos.
 
 Still to confirm on the first real run:
 
 - Passing the broker config inline with `sbx run --name N -- --mcp-config '<json>'`.
-- `template/build.sh` (`docker save` followed by `sbx template load`), and whether `dotnet-sdk-10.0` exists in 26.04.
+- `sbx template load` taking the image from the `docker save` tar that `template/build.sh` writes.
 
 ## Setup
 
