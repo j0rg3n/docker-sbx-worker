@@ -2,8 +2,9 @@
 """sbx-worker: run Claude Code in a locked-down Docker Sandbox for one project.
 
   sbx-worker up     <project>   start broker + proxies, create/configure the sandbox, and run
-                                Claude in tmux session sbxw-<project>; if that session is
-                                already running, just attach to it
+                                Claude in tmux session sbxw-<project>, resuming the previous
+                                conversation if there is one; if that session is already
+                                running, just attach to it
   sbx-worker attach <project>   attach to the running tmux session
   sbx-worker broker <project>   run only the broker in the foreground (debugging)
   sbx-worker down   <project>   end the tmux session (stops the loop) and the broker;
@@ -34,6 +35,7 @@ import sys
 import tarfile
 import time
 import tomllib
+import uuid
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -318,6 +320,28 @@ def push_home_files(name, files):
 
 # ------------------------------------------------------------------- commands
 
+def claude_session(cfg, name):
+    """Claude's --name/--session-id or --resume arguments, so `up` after `down` or a reboot
+    continues the same conversation. The id is kept on the host in <state_dir>/session-id;
+    delete that file to start a new conversation on the next `up`."""
+    idfile = cfg.state_dir / "session-id"
+    sid = idfile.read_text().strip() if idfile.exists() else ""
+    if sid:
+        try:
+            sid = str(uuid.UUID(sid))
+        except ValueError:
+            sid = ""
+    if sid:
+        # Claude stores each conversation as ~/.claude/projects/<cwd>/<id>.jsonl in the VM.
+        r = run("sbx", "exec", name, "sh", "-c", f'ls "$HOME"/.claude/projects/*/{sid}.jsonl',
+                capture=True, check=False)
+        if r.returncode == 0:
+            return ["--name", name, "--resume", sid]
+    sid = str(uuid.uuid4())
+    idfile.write_text(sid + "\n")
+    return ["--name", name, "--session-id", sid]
+
+
 def cmd_up(project):
     path, cfg, raw = load(project)
     if shutil.which("sbx") is None:
@@ -379,7 +403,8 @@ def cmd_up(project):
     }}})
     claude = shlex.join(["sbx", "run", "--name", name,
                          "-e", "ENABLE_CLAUDEAI_MCP_SERVERS=false",   # no claude.ai connectors
-                         "--", "--strict-mcp-config", "--mcp-config", mcp])
+                         "--", "--strict-mcp-config", "--mcp-config", mcp,
+                         *claude_session(cfg, name)])
     # Create the session first so remain-on-exit is set before Claude starts: if it exits
     # immediately, the pane stays open with the error instead of the session vanishing.
     run("tmux", "new-session", "-d", "-s", name, "-x", "220", "-y", "50")
