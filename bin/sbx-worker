@@ -250,6 +250,29 @@ def sandbox_exists(name):
     return any(line.split()[:1] == [name] for line in (r.stdout or "").splitlines())
 
 
+def template_listed(tag, listing):
+    """Whether `sbx template ls` output names `tag`, as `[registry/]repo:tag` or in two columns."""
+    repo, _, version = tag.rpartition(":") if ":" in tag else (tag, "", "latest")
+    for line in listing.splitlines():
+        cols = line.split()
+        if any(c == tag or c.endswith("/" + tag) for c in cols) or (repo in cols and version in cols):
+            return True
+    return False
+
+
+def ensure_template(tag):
+    # sbx create runs with --pull never, and the template is a local image: without this it
+    # fails well into setup with "not cached locally", after the broker and proxies are up.
+    r = run("sbx", "template", "ls", capture=True, check=False)
+    if r.returncode != 0:
+        print(f"sbx-worker: could not list sbx templates; not checking for {tag}", file=sys.stderr)
+        return
+    if not template_listed(tag, r.stdout or ""):
+        die(f"sbx template {tag} is not loaded. Build and load it with\n"
+            f"  {ROOT / 'template' / 'build.sh'} {tag}\n"
+            f"or remove agent.template from the project config to use the default image.")
+
+
 def ensure_allowed(name, port):
     rules = run("sbx", "policy", "ls", name, "--wide", capture=True, check=False).stdout or ""
     if f"localhost:{port}" not in rules:
@@ -335,6 +358,8 @@ def cmd_up(project):
         print(f"{name} is already running; attaching. Use `sbx-worker down {cfg.name}` to restart it.")
         tmux_attach(name)
 
+    if a.get("template") and not sandbox_exists(name):
+        ensure_template(a["template"])
     ensure_ssh_forwarding_off()
     ensure_no_gateway_servers()
     forge_broker.Tools(cfg).sync_source()      # the repo sbx mounts read-only
